@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>iSPL Speech Emotion — Live Speech Emotion</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=Outfit:wght@300;400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <div class="vignette" aria-hidden="true"></div>
+
+    <header class="top">
+      <div class="brand">
+        <span class="seal">共</span>
+        <div>
+          <p class="wordmark">iSPL Lab<span class="wordmark-rest"> - Kyungpook National University</span></p>
+          <p class="sub">KITE · XLS-R logit adjustment · live</p>
+        </div>
+      </div>
+      <div class="status">
+        <span class="dot" id="liveDot"></span>
+        <span id="statusLabel">idle</span>
+        <span class="sep">/</span>
+        <span id="modelLabel">LGCAIFR</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="stage">
+        <div class="orbit-wrap">
+          <canvas id="orbit"></canvas>
+          <div class="readout">
+            <p class="ko" id="emotionKo">귀를 기울이다</p>
+            <h1 id="emotionEn">Quiet</h1>
+            <p class="conf" id="confidence">tap listen to begin</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="mixer" id="mixer" aria-label="Emotion mix"></section>
+
+      <section class="telemetry" aria-label="Live metrics">
+        <div class="telemetry-meta">
+          <span>live metrics</span>
+          <span id="metricContext">hop — · —</span>
+        </div>
+        <div class="metric-grid">
+          <div class="metric" data-key="infer">
+            <span class="metric-k">infer</span>
+            <span class="metric-v" id="mInfer">—</span>
+          </div>
+          <div class="metric" data-key="feat">
+            <span class="metric-k">features</span>
+            <span class="metric-v" id="mFeat">—</span>
+          </div>
+          <div class="metric" data-key="total">
+            <span class="metric-k">total</span>
+            <span class="metric-v" id="mTotal">—</span>
+          </div>
+          <div class="metric">
+            <span class="metric-k">avg</span>
+            <span class="metric-v" id="mAvg">—</span>
+          </div>
+          <div class="metric">
+            <span class="metric-k">p95</span>
+            <span class="metric-v" id="mP95">—</span>
+          </div>
+          <div class="metric">
+            <span class="metric-k">rate</span>
+            <span class="metric-v" id="mRate">—</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="ribbon-wrap" aria-label="Emotion over time">
+        <div class="ribbon-meta">
+          <span>trace</span>
+          <span id="latency">— ms</span>
+        </div>
+        <canvas id="ribbon"></canvas>
+      </section>
+    </main>
+
+    <footer class="dock">
+      <label class="mic-pick">
+        <span>Input</span>
+        <select id="micSelect" aria-label="Microphone">
+          <option value="">Default microphone</option>
+        </select>
+      </label>
+      <button type="button" class="listen" id="listenBtn">
+        <span class="listen-ring"></span>
+        <span id="listenLabel">Listen</span>
+      </button>
+      <p class="hint" id="hint">
+        <span class="hint-lead">Pick your headset mic, then tap listen.</span>
+        <span class="hint-rest"> Headphone playback is not a microphone.</span>
+      </p>
+    </footer>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
