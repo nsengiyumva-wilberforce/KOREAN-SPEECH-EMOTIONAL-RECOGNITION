@@ -1,8 +1,9 @@
 """Combine the class-weighted XLS-R model with the balanced-batch model.
 
 The class-weighted model is the logit-adjusted checkpoint (tau 0.75).
-When it predicts neutral and the balanced model predicts anger, sadness,
-or surprise by a margin chosen on validation, the balanced prediction is used.
+When it predicts neutral and the balanced model predicts anger or sadness
+by a gap of 0.8, the balanced prediction is used. Surprise uses its own
+gap, chosen on validation, and the test set is scored once.
 """
 
 import os
@@ -28,8 +29,8 @@ BALANCED = os.path.join(
     RECIPE, "results", "kite_xlsr_balanced", "1993", "hyperparams.yaml"
 )
 TAU = 0.75
-RARE = ("anger", "sadness", "surprise")
-MARGINS = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
+RARE_MARGIN = 0.8
+SURPRISE_MARGINS = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8]
 MIN_WA = 0.50
 
 
@@ -88,21 +89,25 @@ def train_log_prior(datasets, hparams):
     return (counts / counts.sum()).clamp(min=1e-8).log()
 
 
-def fuse(weighted_log, balanced_log, class_names, margin):
-    """Override a neutral prediction when the balanced model is clearly rare."""
+def fuse(weighted_log, balanced_log, class_names, surprise_margin):
+    """Override neutral when the balanced model is clearly a rare class.
+
+    Anger and sadness keep the gap already chosen for the shared rule.
+    Surprise uses surprise_margin.
+    """
     names = {name: index for index, name in enumerate(class_names)}
     neutral = names["neutral"]
-    rare = {names[name] for name in RARE}
     weighted_pred = weighted_log.argmax(dim=-1)
     balanced_prob = balanced_log.exp()
     balanced_pred = balanced_prob.argmax(dim=-1)
-    chosen = balanced_pred
-    rare_prob = balanced_prob.gather(1, chosen.unsqueeze(1)).squeeze(1)
-    neutral_prob = balanced_prob[:, neutral]
-    clear = torch.zeros(len(balanced_pred), dtype=torch.bool)
-    for index in rare:
-        clear |= balanced_pred == index
-    clear &= (rare_prob - neutral_prob) >= margin
+    rare_prob = balanced_prob.gather(1, balanced_pred.unsqueeze(1)).squeeze(1)
+    gap = rare_prob - balanced_prob[:, neutral]
+    anger_sad = (balanced_pred == names["anger"]) | (
+        balanced_pred == names["sadness"]
+    )
+    clear = (anger_sad & (gap >= RARE_MARGIN)) | (
+        (balanced_pred == names["surprise"]) & (gap >= surprise_margin)
+    )
     use_balanced = (weighted_pred == neutral) & clear
     return torch.where(use_balanced, balanced_pred, weighted_pred), use_balanced
 
@@ -146,69 +151,92 @@ def main():
     del balanced_brain
     torch.cuda.empty_cache()
 
-    print("margin  valid_WA  valid_UA  overrides", flush=True)
+    print(
+        "surprise_margin  valid_WA  valid_UA  overrides  "
+        "(anger and sadness stay at %.2f)" % RARE_MARGIN,
+        flush=True,
+    )
     rows = []
-    for margin in MARGINS:
+    for margin in SURPRISE_MARGINS:
         predictions, overrides = fuse(
             weighted["valid"], balanced["valid"], names, margin
         )
         _, wa, ua = score(predictions, labels["valid"], names)
+        n_overrides = int(overrides.sum())
         print(
-            f"{margin:5.2f}  {wa * 100:7.2f}%  {ua * 100:7.2f}%  {int(overrides.sum())}",
+            f"{margin:5.2f}  {wa * 100:7.2f}%  {ua * 100:7.2f}%  {n_overrides}",
             flush=True,
         )
-        rows.append({"margin": margin, "wa": wa, "ua": ua})
-    print("margin  test_WA  test_UA  overrides", flush=True)
-    test_rows = []
-    for row in rows:
-        predictions, overrides = fuse(
-            weighted["test"], balanced["test"], names, row["margin"]
-        )
-        confusion, wa, ua = score(predictions, labels["test"], names)
-        print(
-            f"{row['margin']:5.2f}  {wa * 100:7.2f}%  {ua * 100:7.2f}%  {int(overrides.sum())}",
-            flush=True,
-        )
-        test_rows.append(
+        rows.append(
             {
-                "margin": row["margin"],
-                "valid_wa": row["wa"],
-                "valid_ua": row["ua"],
+                "margin": margin,
                 "wa": wa,
                 "ua": ua,
-                "overrides": int(overrides.sum()),
-                "confusion": confusion,
+                "overrides": n_overrides,
             }
         )
 
-    # Keep weighted accuracy at or above 50% on validation. Among those
-    # margins, take the one that still lets the balanced model override.
-    eligible = [row for row in test_rows if row["valid_wa"] >= MIN_WA and row["overrides"] > 0]
+    # The surprise gap is locked on validation before the test set is read.
+    eligible = [
+        row
+        for row in rows
+        if row["wa"] >= MIN_WA and row["overrides"] > 0
+    ]
     if not eligible:
-        eligible = [row for row in test_rows if row["valid_wa"] >= MIN_WA]
-    chosen = max(eligible, key=lambda row: (row["valid_ua"], row["valid_wa"]))
-    text = _format_confusion(chosen["confusion"], names, chosen["wa"], chosen["ua"])
+        eligible = [row for row in rows if row["wa"] >= MIN_WA]
+    chosen = max(eligible, key=lambda row: (row["ua"], row["wa"], -row["margin"]))
+    predictions, overrides = fuse(
+        weighted["test"], balanced["test"], names, chosen["margin"]
+    )
+    confusion, wa, ua = score(predictions, labels["test"], names)
+    surprise_index = names.index("surprise")
+    surprise_overrides = int(
+        (overrides & (predictions == surprise_index)).sum()
+    )
+    print(
+        f"chosen surprise margin {chosen['margin']:.2f}  "
+        f"test WA {wa * 100:.2f}%  test UA {ua * 100:.2f}%  "
+        f"overrides {int(overrides.sum())}  "
+        f"surprise overrides {surprise_overrides}",
+        flush=True,
+    )
+    text = _format_confusion(confusion, names, wa, ua)
     out_dir = os.path.join(RECIPE, "results", "kite_fusion")
     os.makedirs(out_dir, exist_ok=True)
-    report = os.path.join(out_dir, "confusion_test.txt")
+    report = os.path.join(out_dir, "confusion_test_surprise.txt")
     with open(report, "w", encoding="utf-8") as handle:
         handle.write(
             "Rule: logit-adjusted class-weighted XLS-R "
             f"(tau {TAU}), overridden when it predicts neutral and the "
-            "balanced model predicts anger, sadness, or surprise with "
-            f"P(rare) - P(neutral) >= {chosen['margin']}.\n"
+            "balanced model predicts anger or sadness with "
+            f"P(class) - P(neutral) >= {RARE_MARGIN}, or surprise with "
+            f"P(surprise) - P(neutral) >= {chosen['margin']}.\n"
         )
         handle.write(
-            f"valid WA: {chosen['valid_wa'] * 100:.2f}%  "
-            f"valid UA: {chosen['valid_ua'] * 100:.2f}%\n"
+            "Surprise margin chosen on validation among settings with "
+            f"valid WA >= {MIN_WA:.2f}, maximizing valid UA.\n"
         )
-        handle.write(f"test overrides: {chosen['overrides']}\n\n")
+        handle.write(
+            f"valid WA: {chosen['wa'] * 100:.2f}%  "
+            f"valid UA: {chosen['ua'] * 100:.2f}%\n"
+        )
+        handle.write(
+            f"test overrides: {int(overrides.sum())}  "
+            f"surprise overrides: {surprise_overrides}\n\n"
+        )
+        handle.write("surprise_margin  valid_WA  valid_UA  overrides\n")
+        for row in rows:
+            handle.write(
+                f"{row['margin']:5.2f}  {row['wa'] * 100:7.2f}%  "
+                f"{row['ua'] * 100:7.2f}%  {row['overrides']}\n"
+            )
+        handle.write("\n")
         handle.write(text)
         handle.write("\n")
     print(text, flush=True)
 
     table = os.path.join(RECIPE, "results", "comparison_table.txt")
-    row_name = "Weighted plus balanced margin"
+    row_name = "Weighted plus surprise margin"
     kept = []
     if os.path.exists(table):
         with open(table, encoding="utf-8") as handle:
@@ -218,7 +246,7 @@ def main():
                 if not line.startswith(row_name + "\t")
             ]
     kept.append(
-        f"{row_name}\t{chosen['wa'] * 100:.2f}%\t{chosen['ua'] * 100:.2f}%\n"
+        f"{row_name}\t{wa * 100:.2f}%\t{ua * 100:.2f}%\n"
     )
     with open(table, "w", encoding="utf-8") as handle:
         handle.writelines(kept)

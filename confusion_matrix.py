@@ -12,14 +12,9 @@ data = np.array([
     [12,  7,  29,   7, 25]
 ])
 
-# Calculate percentages per row (true emotions)
+# Normalize the data by row (true emotions) so each row sums to 1
 row_sums = data.sum(axis=1)[:, np.newaxis]
-percentages = (data / row_sums) * 100
-
-# Create formatted labels combining count and percentage
-labels = (np.asarray(["{0}\n{1:.1f}%".format(count, perc) 
-                      for count, perc in zip(data.flatten(), percentages.flatten())])
-         ).reshape(data.shape)
+normalized_data = data / row_sums
 
 # Set up the plot
 plt.figure(figsize=(10, 7))
@@ -27,17 +22,20 @@ plt.figure(figsize=(10, 7))
 # Create a brick-colored colormap
 brick_cmap = sns.light_palette("firebrick", as_cmap=True)
 
-# Generate the heatmap
-ax = sns.heatmap(data, 
-                 annot=labels, 
-                 fmt="", 
-                 cmap=brick_cmap, 
-                 xticklabels=classes, 
-                 yticklabels=classes,
-                 cbar_kws={'label': 'Number of predictions'})
+# Generate the heatmap using the normalized data
+# vmin=0 and vmax=1 keep the color scale locked from 0% to 100%
+sns.heatmap(normalized_data, 
+            annot=True, 
+            fmt=".1%",  # Automatically formats the decimals as percentages (e.g., 41.1%)
+            cmap=brick_cmap, 
+            vmin=0, 
+            vmax=1,
+            xticklabels=classes, 
+            yticklabels=classes,
+            cbar_kws={'label': 'Percentage of True Emotion'})
 
 # Formatting labels and title
-plt.title('Emotion Confusion Matrix', fontsize=14, pad=15)
+plt.title('Normalized Emotion Confusion Matrix', fontsize=14, pad=15)
 plt.xlabel('Predicted Emotion', fontsize=12, labelpad=10)
 plt.ylabel('True Emotion', fontsize=12, labelpad=10)
 
@@ -48,6 +46,6 @@ plt.yticks(rotation=0)
 plt.tight_layout()
 
 # Save the plot as a PNG image
-output_filename = 'brick_confusion_matrix.png'
+output_filename = 'normalized_brick_confusion_matrix.png'
 plt.savefig(output_filename, dpi=300, bbox_inches='tight')
-print(f"Confusion matrix successfully saved as {output_filename}")
+print(f"Normalized confusion matrix successfully saved as {output_filename}")

@@ -34,8 +34,11 @@ class EmoIdBrain(sb.Brain):
         # last dim will be used for AdaptiveAVG pool
         outputs = self.hparams.avg_pool(outputs, lens)
         outputs = outputs.view(outputs.shape[0], -1)
-
         outputs = self.modules.output_mlp(outputs)
+        self._mixup_pooled = None
+        if stage == sb.Stage.TRAIN and getattr(self.hparams, "latent_mixup", False):
+            self._mixup_pooled = outputs
+
         outputs = self.hparams.log_softmax(outputs)
         return outputs
 
@@ -47,6 +50,10 @@ class EmoIdBrain(sb.Brain):
         emoid = emoid.squeeze(1)
         weight = self.hparams.class_weight.to(predictions.device)
         loss = self.hparams.compute_cost(predictions, emoid, weight=weight)
+        if stage == sb.Stage.TRAIN and getattr(self.hparams, "latent_mixup", False):
+            mixed = self._latent_mixup_loss(emoid, weight)
+            if mixed is not None:
+                loss = 0.5 * (loss + mixed)
         if stage != sb.Stage.TRAIN:
             self.error_metrics.append(batch.id, predictions, emoid)
             predicted = predictions.argmax(dim=-1)
@@ -67,6 +74,35 @@ class EmoIdBrain(sb.Brain):
                     self.pred_rows.append((utt_id, names[pred_i], true_name))
 
         return loss
+
+    def _latent_mixup_loss(self, labels, weight):
+        """Soft class-weighted loss on a mix of two pooled representations.
+
+        Lambda is uniform on [0, 1], which is Beta(1, 1). The mix is
+        lambda * h_left + (1 - lambda) * h_right, and the target is the same
+        combination of the two labels.
+        """
+        pooled = self._mixup_pooled
+        if pooled is None or pooled.shape[0] < 2:
+            return None
+        losses = []
+        for start in range(0, pooled.shape[0] - 1, 2):
+            mix_weight = torch.rand((), device=pooled.device)
+            mixed = (
+                mix_weight * pooled[start]
+                + (1.0 - mix_weight) * pooled[start + 1]
+            )
+            mixed_log = self.hparams.log_softmax(
+                self.modules.output_mlp(mixed.unsqueeze(0))
+            )
+            first = self.hparams.compute_cost(
+                mixed_log, labels[start : start + 1], weight=weight
+            )
+            second = self.hparams.compute_cost(
+                mixed_log, labels[start + 1 : start + 2], weight=weight
+            )
+            losses.append(mix_weight * first + (1.0 - mix_weight) * second)
+        return torch.stack(losses).mean()
 
     def on_stage_start(self, stage, epoch=None):
         """Gets called at the beginning of each epoch.
@@ -193,15 +229,35 @@ class EmoIdBrain(sb.Brain):
         n_freeze = int(self.hparams.freeze_transformer_layers)
         if n_freeze > 0:
             layers = self.modules.wav2vec2.model.encoder.layers
+            if n_freeze > len(layers):
+                raise ValueError(
+                    f"Cannot freeze {n_freeze} layers; the encoder has {len(layers)}."
+                )
             for layer in list(layers)[:n_freeze]:
                 for param in layer.parameters():
                     param.requires_grad = False
-            logger.info("Froze the first %d wav2vec transformer layers", n_freeze)
+            logger.info(
+                "Froze the first %d of %d transformer layers",
+                n_freeze,
+                len(layers),
+            )
+        if getattr(self.hparams, "latent_mixup", False):
+            logger.info(
+                "Latent mixup on, rare-class pair probability %.2f",
+                float(self.hparams.latent_mixup_rare_prob),
+            )
         super().on_fit_start()
 
     def make_dataloader(self, dataset, stage, ckpt_prefix="dataloader-", **loader_kwargs):
         """Use class-balanced draws for training when that switch is on."""
-        if stage == sb.Stage.TRAIN and self.hparams.balanced_sampling:
+        if stage == sb.Stage.TRAIN and getattr(self.hparams, "latent_mixup", False):
+            loader_kwargs = dict(loader_kwargs)
+            for key in ("shuffle", "sampler", "batch_size", "drop_last"):
+                loader_kwargs.pop(key, None)
+            loader_kwargs["batch_sampler"] = _rare_pair_batch_sampler(
+                dataset, self.hparams
+            )
+        elif stage == sb.Stage.TRAIN and self.hparams.balanced_sampling:
             loader_kwargs = dict(loader_kwargs)
             loader_kwargs.pop("shuffle", None)
             loader_kwargs["sampler"] = _balanced_sampler(
@@ -395,6 +451,51 @@ def _map_emotion(emo, hparams):
     return emo
 
 
+class _RarePairBatchSampler(torch.utils.data.Sampler):
+    """Pairs for latent mixup. Some pairs replace one side with a rare class."""
+
+    def __init__(self, dataset_length, rare_indices, rare_prob):
+        self.dataset_length = dataset_length
+        self.rare_indices = list(rare_indices)
+        self.rare_prob = rare_prob
+
+    def __iter__(self):
+        order = list(range(self.dataset_length))
+        random.shuffle(order)
+        if len(order) % 2 == 1:
+            order = order[:-1]
+        for start in range(0, len(order), 2):
+            left = order[start]
+            right = order[start + 1]
+            if self.rare_indices and random.random() < self.rare_prob:
+                rare = random.choice(self.rare_indices)
+                if random.random() < 0.5:
+                    left = rare
+                else:
+                    right = rare
+            yield [left, right]
+
+    def __len__(self):
+        return self.dataset_length // 2
+
+
+def _rare_pair_batch_sampler(dataset, hparams):
+    """Build pairs of two. Half of them contain anger, sadness, or surprise."""
+    if int(hparams.batch_size) != 2:
+        raise ValueError("Latent mixup builds pairs for batch size 2.")
+    rare = {"anger", "sadness", "surprise"}
+    rare_indices = [
+        index
+        for index, utt_id in enumerate(dataset.data_ids)
+        if _map_emotion(dataset.data[utt_id]["emo"], hparams) in rare
+    ]
+    return _RarePairBatchSampler(
+        len(dataset.data_ids),
+        rare_indices,
+        float(hparams.latent_mixup_rare_prob),
+    )
+
+
 def _balanced_sampler(dataset, label_encoder, hparams):
     """Draw each emotion about equally often within an epoch."""
     labels = []
@@ -566,6 +667,78 @@ def _run_logit_adjustment(brain, datasets, hparams):
         text,
     )
 
+    # Anger is the class still well below 50% recall after the shared tau.
+    # The extra bonus is chosen on validation, then the test set is scored once.
+    anger_index = hparams["class_names"].index("anger")
+    anger_offsets = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+    min_wa = 0.50
+    logger.info(
+        "anger offset at tau %.2f, validation, WA floor %.0f%%",
+        best["tau"],
+        min_wa * 100,
+    )
+    anger_rows = []
+    valid_base = valid_log - best["tau"] * log_prior
+    for offset in anger_offsets:
+        shifted = valid_base.clone()
+        shifted[:, anger_index] += offset
+        confusion = _confusion_from_preds(
+            shifted.argmax(dim=-1), valid_y, len(hparams["class_names"])
+        )
+        offset_wa, offset_ua = _wa_ua(confusion)
+        logger.info(
+            "anger offset %.2f  valid WA %.2f%%  UA %.2f%%",
+            offset,
+            offset_wa * 100,
+            offset_ua * 100,
+        )
+        anger_rows.append(
+            {"offset": offset, "wa": offset_wa, "ua": offset_ua}
+        )
+    eligible = [row for row in anger_rows if row["wa"] >= min_wa]
+    if not eligible:
+        eligible = anger_rows
+    chosen_offset = max(
+        eligible, key=lambda row: (row["ua"], row["wa"], -row["offset"])
+    )
+    test_shifted = test_log - best["tau"] * log_prior
+    test_shifted = test_shifted.clone()
+    test_shifted[:, anger_index] += chosen_offset["offset"]
+    confusion = _confusion_from_preds(
+        test_shifted.argmax(dim=-1), test_y, len(hparams["class_names"])
+    )
+    wa, ua = _wa_ua(confusion)
+    text = _format_confusion(confusion, hparams["class_names"], wa, ua)
+    report = os.path.join(hparams["output_folder"], "confusion_test_anger.txt")
+    with open(report, "w", encoding="utf-8") as handle:
+        handle.write(
+            f"tau: {best['tau']}  anger offset: {chosen_offset['offset']}\n"
+        )
+        handle.write(
+            "Anger offset chosen on validation among settings with "
+            f"valid WA >= {min_wa:.2f}, maximizing valid UA.\n"
+        )
+        handle.write(
+            f"valid WA: {chosen_offset['wa'] * 100:.2f}%  "
+            f"valid UA: {chosen_offset['ua'] * 100:.2f}%\n\n"
+        )
+        handle.write("anger_offset  valid_WA  valid_UA\n")
+        for row in anger_rows:
+            handle.write(
+                f"{row['offset']:5.2f}  {row['wa'] * 100:7.2f}%  "
+                f"{row['ua'] * 100:7.2f}%\n"
+            )
+        handle.write("\n")
+        handle.write(text)
+        handle.write("\n")
+    logger.info(
+        "Anger offset %.2f  test WA %.2f%%  UA %.2f%%\n%s",
+        chosen_offset["offset"],
+        wa * 100,
+        ua * 100,
+        text,
+    )
+
 
 def _build_hidden_classifier(hparams):
     """Replace the linear head with a two-layer classifier when requested."""
@@ -620,6 +793,7 @@ if __name__ == "__main__":
                 "save_json_valid": hparams["valid_annotation"],
                 "save_json_test": hparams["test_annotation"],
                 "emotions": hparams["emotions"],
+                "train_wav_folder": hparams.get("train_wav_folder") or None,
             },
         )
 

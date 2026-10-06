@@ -24,6 +24,7 @@ def prepare_data(
     save_json_test,
     metadata_csv=None,
     emotions=KEEP_EMOTIONS,
+    train_wav_folder=None,
 ):
     """Write train, valid, and test JSON manifests for KITE.
 
@@ -44,6 +45,10 @@ def prepare_data(
         ``data_folder``.
     emotions : list
         Emotion names to keep. Comparison is case-insensitive.
+    train_wav_folder : str
+        Directory of voice-only training wavs, same file names as the
+        originals. Validation and test keep the drama wavs in
+        ``data_folder``. Empty or None leaves training on the originals.
     """
     if skip(save_json_train, save_json_valid, save_json_test):
         logger.info("Preparation already completed, skipping.")
@@ -70,9 +75,13 @@ def prepare_data(
         ", ".join(sorted(keep)),
     )
 
+    if train_wav_folder:
+        train_wav_folder = os.path.abspath(train_wav_folder)
+
     manifests = {"train": {}, "valid": {}, "test": {}}
     missing_wavs = 0
     unknown_split = 0
+    missing_separated = []
 
     for row in df.itertuples(index=False):
         split_name = SPLIT_TO_JSON.get(row.split)
@@ -85,6 +94,12 @@ def prepare_data(
         if not os.path.isfile(wav_path):
             missing_wavs += 1
             continue
+        if split_name == "train" and train_wav_folder:
+            separated = os.path.join(train_wav_folder, wav_name)
+            if not os.path.isfile(separated):
+                missing_separated.append(wav_name)
+                continue
+            wav_path = separated
 
         uttid = os.path.splitext(wav_name)[0]
         manifests[split_name][uttid] = {
@@ -97,6 +112,13 @@ def prepare_data(
         logger.warning("Dropped %d rows with an unknown split.", unknown_split)
     if missing_wavs:
         logger.warning("Dropped %d rows whose wav file is missing.", missing_wavs)
+    if missing_separated:
+        raise ValueError(
+            f"{len(missing_separated)} training clips have no voice-only wav "
+            f"in {train_wav_folder}. Finish separate_train.py before training."
+        )
+    if train_wav_folder:
+        logger.info("Training wavs read from %s", train_wav_folder)
 
     outputs = {
         "train": save_json_train,

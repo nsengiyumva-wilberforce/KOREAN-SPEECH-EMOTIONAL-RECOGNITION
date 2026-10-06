@@ -33,7 +33,14 @@ class_weighting: inverse
 augment_rare: False
 augment_prob: 0.8
 balanced_sampling: False
+# Mix the two pooled vectors in a training batch. Half the batches include
+# anger, sadness, or surprise. The class-weighted loss on the real clips stays.
+latent_mixup: False
+latent_mixup_rare_prob: 0.5
 freeze_transformer_layers: 0
+# Voice-only copies of the training clips. Empty keeps the original drama wavs.
+# Validation and test always stay on data_folder.
+train_wav_folder: ""
 classifier_hidden: 0
 label_mode: flat
 neutral_name: neutral
