@@ -176,11 +176,13 @@ class EmoIdBrain(sb.Brain):
             )
 
             # The train_logger writes a summary to stdout and to the logfile.
-            self.hparams.train_logger.log_stats(
-                {"Epoch": epoch, "lr": old_lr, "wave2vec_lr": old_lr_wav2vec2},
-                train_stats={"loss": self.train_loss},
-                valid_stats=stats,
-            )
+            # One process writes. All processes still anneal, so the rates match.
+            if sb.utils.distributed.if_main_process():
+                self.hparams.train_logger.log_stats(
+                    {"Epoch": epoch, "lr": old_lr, "wave2vec_lr": old_lr_wav2vec2},
+                    train_stats={"loss": self.train_loss},
+                    valid_stats=stats,
+                )
 
             # Save the current checkpoint and delete previous checkpoints,
             self.checkpointer.save_and_keep_only(
@@ -189,13 +191,13 @@ class EmoIdBrain(sb.Brain):
                 keep_recent=False,
             )
 
-        if stage != sb.Stage.TRAIN:
+        if stage != sb.Stage.TRAIN and sb.utils.distributed.if_main_process():
             split = "valid" if stage == sb.Stage.VALID else "test"
             split = getattr(self, "report_split", split)
             self._write_confusion(split)
 
         # We also write statistics about test data to stdout and to logfile.
-        if stage == sb.Stage.TEST:
+        if stage == sb.Stage.TEST and sb.utils.distributed.if_main_process():
             split = getattr(self, "report_split", "test")
             stat_name = "valid_stats" if split == "valid" else "test_stats"
             self.hparams.train_logger.log_stats(

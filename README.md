@@ -15,7 +15,7 @@ Test scores for that checkpoint:
 
 Tau 0.75 is chosen on the validation set (validation unweighted accuracy 47.12%, weighted accuracy 51.18%). The tau-0.75 test score is the number to report. The same seed, split, and recipe should land near these figures. Keep the tau that won on validation. The test table is only for the final report.
 
-Follow the sections in order: install, extract, train, then logit adjustment.
+Follow the sections in order: install, extract, then train. Section 3 is the single-GPU HuBERT large run. Section 4 is HuBERT xlarge on 3 GPUs. Logit adjustment comes after training.
 
 ## 1. Install
 
@@ -64,7 +64,31 @@ Training runs 30 epochs. The head learning rate is 1e-4 and the encoder learning
 
 At the end the script reloads that checkpoint and writes `confusion_valid.txt` and `confusion_test.txt` in the output folder. Rows are the true emotion. Columns are the prediction. Read both weighted and unweighted accuracy from `confusion_test.txt`. That plain test matrix is the first row of the table at the top.
 
-## 4. Logit adjustment
+## 4. Train HuBERT xlarge on 3 GPUs
+
+`hparams/train_hubert_xlarge.yaml` loads `team-lucid/hubert-xlarge-korean` (1B parameters, 48 transformer layers, hidden size 1280). The linear head is sized to 1280. Batch size 4 is the batch on each GPU. Launch three processes so each update sees 12 clips. Learning rates stay the same as the large run: 1e-4 for the head and 1e-5 for the encoder. The run is written to `results/kite_hubert_xlarge_korean/1993` and does not touch the large checkpoint.
+
+```bash
+torchrun --nproc_per_node=3 train_with_wav2vec2.py hparams/train_hubert_xlarge.yaml \
+  --data_folder /path/to/KITE \
+  --metadata_csv /path/to/KITE/1_metadata_ser.csv
+```
+
+Validation and test still score the full split, and one process writes the log and the confusion files. After training, score and sweep tau with one process. Do not use `torchrun` for these two commands.
+
+```bash
+python train_with_wav2vec2.py hparams/train_hubert_xlarge.yaml \
+  --data_folder /path/to/KITE \
+  --metadata_csv /path/to/KITE/1_metadata_ser.csv \
+  --test_only
+
+python train_with_wav2vec2.py hparams/train_hubert_xlarge.yaml \
+  --data_folder /path/to/KITE \
+  --metadata_csv /path/to/KITE/1_metadata_ser.csv \
+  --logit_adjust True
+```
+
+## 5. Logit adjustment
 
 Run this after training has finished, in the same output folder. It does not train. It subtracts `tau * log(train prior)` from the log-probabilities, sweeps the tau list in the hyperparameters on the validation set, and scores the test set once at the tau with the highest validation unweighted accuracy.
 
@@ -79,7 +103,7 @@ python train_with_wav2vec2.py hparams/train_with_wav2vec2.yaml \
 
 The report is `results/kite_hubert_large_korean/1993/confusion_test_logit.txt`. On the finished run the selected tau was 0.75, with test weighted accuracy 54.06% and unweighted accuracy 48.39%.
 
-## 5. Score the checkpoint again
+## 6. Score the checkpoint again
 
 `--test_only` is a flag. Do not write `--test_only True`. This loads the saved macro-F1 checkpoint and rewrites the plain validation and test matrices. It does not apply logit adjustment.
 
@@ -92,7 +116,7 @@ python train_with_wav2vec2.py hparams/train_with_wav2vec2.yaml \
   --test_only
 ```
 
-## 6. Ablations
+## 7. Ablations
 
 These are the finished comparisons on the same split. Each row is the checkpoint with the best validation macro-F1. Validation F1 is macro-F1 shown as a percentage. Runs that never produced a test score are omitted. The last row is the score to report.
 
